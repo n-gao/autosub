@@ -24,6 +24,11 @@ DEFAULT_SUBTITLE_FORMAT = 'srt'
 DEFAULT_CONCURRENCY = 10
 DEFAULT_SRC_LANGUAGE = 'en'
 DEFAULT_DST_LANGUAGE = 'en'
+DEFAULT_MIN_LENGTH = 0.5
+DEFAULT_MAX_LENGTH = 6
+DEFAULT_PERCENTILE = 0.2
+DEFAULT_FRAME_CUT = 2
+DEFAULT_INTERVAL = 30
 
 
 def percentile(arr, percent):
@@ -82,7 +87,7 @@ class SpeechRecognizer(object):
                 except requests.exceptions.ConnectionError:
                     continue
 
-                for line in resp.content.decode().split("\n"):
+                for line in resp.content.decode(encoding='UTF-8').split("\n"):
                     try:
                         line = json.loads(line)
                         line = line['result'][0]['alternative'][0]['transcript']
@@ -152,7 +157,7 @@ def extract_audio(filename, channels=1, rate=16000):
     return temp.name, rate
 
 
-def find_speech_regions(filename, frame_width=4096, min_region_size=0.5, max_region_size=6):
+def find_speech_regions(filename, frame_width=4096, silent_percentile=0.2, min_region_size=0.5, max_region_size=6, silent_frame_cut=2, percentile_interval=30):
     reader = wave.open(filename)
     sample_width = reader.getsampwidth()
     rate = reader.getframerate()
@@ -166,24 +171,55 @@ def find_speech_regions(filename, frame_width=4096, min_region_size=0.5, max_reg
         chunk = reader.readframes(frame_width)
         energies.append(audioop.rms(chunk, sample_width * n_channels))
 
-    threshold = percentile(energies, 0.2)
+    new_eng = []
+    n_samples_30_sec = int(percentile_interval/chunk_duration)
+    for i in range(len(energies)):
+        vals = []
+        for j in range(-n_samples_30_sec//2, n_samples_30_sec//2):
+            if i + j < 0:
+                vals.append(energies[0])
+            elif i + j >= len(energies):
+                vals.append(energies[len(energies) - 1])
+            else:
+                vals.append(energies[i + j])
+        new_eng.append(percentile(vals, silent_percentile))
+
+    with open("test.txt", 'w') as f:
+        for e in new_eng:
+            f.write(str(int(e)) + '\n')
+
+    threshold = percentile(energies, silent_percentile)
 
     elapsed_time = 0
 
     regions = []
     region_start = None
 
+    silent_frames = 0
+    first_silence = -1
+    i = 0
     for energy in energies:
-        is_silence = energy <= threshold
+        is_silence = energy <= new_eng[i]
+        i+=1
         max_exceeded = region_start and elapsed_time - region_start >= max_region_size
 
-        if (max_exceeded or is_silence) and region_start:
+        if is_silence:
+            if silent_frames == 0:
+                first_silence = elapsed_time
+            silent_frames += 1
+        else:
+            silent_frames = 0
+        if not is_silence or max_exceeded:
+            first_silence = elapsed_time
+
+        if (max_exceeded or silent_frames >= silent_frame_cut) and region_start:
             if elapsed_time - region_start >= min_region_size:
-                regions.append((region_start, elapsed_time))
+                regions.append((region_start - chunk_duration, first_silence + chunk_duration))
                 region_start = None
 
         elif (not region_start) and (not is_silence):
             region_start = elapsed_time
+            silent_frames = 0
         elapsed_time += chunk_duration
     return regions
 
@@ -204,6 +240,11 @@ def main():
                         default=DEFAULT_DST_LANGUAGE)
     parser.add_argument('-K', '--api-key',
                         help="The Google Translate API key to be used. (Required for subtitle translation)")
+    parser.add_argument('-L', '--min-length', help="Minimum length of a speech sample.", type=float, default=DEFAULT_MIN_LENGTH)
+    parser.add_argument('-U', '--max-length', help="Maximum length of a speech sample.", type=float, default=DEFAULT_MAX_LENGTH)
+    parser.add_argument('-P', '--silent-percentile', help="Percentile of speech which is considered silent.", type=float, default=DEFAULT_PERCENTILE)
+    parser.add_argument('-SF', '--silent-frame-cut', help="Amount of silent frames till cut.", type=int, default=DEFAULT_FRAME_CUT)
+    parser.add_argument('-I', '--interval', help="Interval in which the percentile will be taken.", type=int, default=DEFAULT_INTERVAL)
     parser.add_argument('--list-formats', help="List all available subtitle formats", action='store_true')
     parser.add_argument('--list-languages', help="List all available source/destination languages", action='store_true')
 
@@ -255,6 +296,11 @@ def main():
             api_key=args.api_key,
             subtitle_file_format=args.format,
             output=args.output,
+            min_sample_length=args.min_length,
+            max_sample_length=args.max_length,
+            silent_percentile=args.silent_percentile,
+            silent_frame_cut=args.silent_frame_cut,
+            interval=args.interval
         )
         print("Subtitles file created at {}".format(subtitle_file_path))
     except KeyboardInterrupt:
@@ -271,10 +317,19 @@ def generate_subtitles(
     dst_language=DEFAULT_DST_LANGUAGE,
     subtitle_file_format=DEFAULT_SUBTITLE_FORMAT,
     api_key=None,
+    min_sample_length=DEFAULT_MIN_LENGTH,
+    max_sample_length=DEFAULT_MAX_LENGTH,
+    silent_percentile=DEFAULT_PERCENTILE,
+    silent_frame_cut=DEFAULT_FRAME_CUT,
+    interval=DEFAULT_INTERVAL
 ):
     audio_filename, audio_rate = extract_audio(source_path)
 
-    regions = find_speech_regions(audio_filename)
+    regions = find_speech_regions(audio_filename, silent_percentile=silent_percentile,
+                                    min_region_size=min_sample_length, max_region_size=max_sample_length,
+                                    silent_frame_cut=silent_frame_cut, percentile_interval=interval)
+
+    print("Found %i regions with potential speech." % len(regions))
 
     pool = multiprocessing.Pool(concurrency)
     converter = FLACConverter(source_path=audio_filename)
@@ -333,6 +388,8 @@ def generate_subtitles(
     timed_subtitles = [(r, t) for r, t in zip(regions, transcripts) if t]
     formatter = FORMATTERS.get(subtitle_file_format)
     formatted_subtitles = formatter(timed_subtitles)
+
+    print("Found %i segments with voice." % len(timed_subtitles))
 
     dest = output
 
