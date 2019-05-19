@@ -226,10 +226,6 @@ def find_speech_regions(filename, frame_width=4096, silent_percentile=0.2, min_r
                 vals.append(energies[i + j])
         new_eng.append(percentile(vals, silent_percentile))
 
-    with open("test.txt", 'w') as f:
-        for e in new_eng:
-            f.write(str(int(e)) + '\n')
-
     threshold = percentile(energies, silent_percentile)
 
     elapsed_time = 0
